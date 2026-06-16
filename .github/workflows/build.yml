@@ -1,0 +1,31 @@
+name: 打包 macOS 可执行文件
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖和 PyInstaller
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: 用 PyInstaller 打包
+        run: |
+          pyinstaller --onefile --name oa_cli oa_cli.py
+
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: oa_cli-mac
+          path: dist/oa_cli

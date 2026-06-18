@@ -1,31 +1,36 @@
-name: 打包 macOS 可执行文件
+name: 打包 approval.py 为 macOS 可执行文件
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'approval.py'
+  workflow_dispatch:   # 允许手动触发
 
 jobs:
-  build-mac:
+  build:
     runs-on: macos-latest
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: 安装依赖和 PyInstaller
+      - name: 安装依赖
         run: |
-          pip install --upgrade pip
-          pip install pyinstaller
+          python -m pip install --upgrade pip
+          pip install requests click pyinstaller
 
-      - name: 用 PyInstaller 打包
+      - name: 使用 PyInstaller 打包为 macOS 可执行文件
         run: |
-          pyinstaller --onefile --name oa_cli oa_cli.py
+          pyinstaller --onefile --name approval-mac approval.py
 
-      - name: 上传成品
+      - name: 上传可执行文件
         uses: actions/upload-artifact@v4
         with:
-          name: oa_cli-mac
-          path: dist/oa_cli
+          name: approval-mac
+          path: dist/approval-mac

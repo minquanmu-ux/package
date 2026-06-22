@@ -1,18 +1,37 @@
 """
 企业微信审批管理CLI工具
 支持查询审批、本地审批（同意/拒绝）、查看本地审批记录、企微消息通知
+配置从外部 config.json 读取，支持打包为 exe (Windows) / 单文件 (macOS)
 """
 import requests
 import time
 import click
 import sqlite3
 import os
+import json
+import sys
 from datetime import datetime, timedelta
 
-# ===================== 企业微信配置 =====================
-CORPID = "wwabc05e746c823209"
-CORPSECRET = "gx0uRp7U_Nz4kZppRKQfdeNuK5pVFKrmX3s4G2jtTwo"
-AGENTID = 1000002  # 改成你的自建应用 AgentId，在应用详情页顶部可以看到
+# ===================== 配置加载 =====================
+def load_config():
+    # 获取可执行文件所在目录（打包后或直接运行）
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(base_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"配置文件 {config_path} 不存在。\n"
+            f"请创建 config.json，内容示例：\n"
+            f'{{\n  "corpid": "你的企业ID",\n  "corpsecret": "你的应用Secret",\n  "agentid": 1000002\n}}'
+        )
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg["corpid"], cfg["corpsecret"], cfg.get("agentid", 1000002)
+
+CORPID, CORPSECRET, AGENTID = load_config()
+# =====================================================
 
 GET_TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 BATCH_APPROVAL_URL = "https://qyapi.weixin.qq.com/cgi-bin/oa/getapprovalinfo"
@@ -21,7 +40,6 @@ SEND_MESSAGE_URL = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
 
 # 数据库配置
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "approval_results.db")
-# =======================================================
 
 token_cache = {"access_token": None, "expire_time": 0}
 
@@ -202,13 +220,25 @@ def query_approval(sp_no):
 
 def format_detail(sp_no, detail):
     info = detail.get("info", {})
+
+    # 本地记录覆盖状态显示
+    local_record = get_local_approval_status(sp_no)
+    if local_record:
+        if local_record["action"] == "approve":
+            display_status = "已通过（本地）"
+        else:
+            display_status = "已驳回（本地）"
+    else:
+        display_status = REVERSE_STATUS_MAP.get(str(info.get('sp_status', '')), '未知')
+
     lines = [
         f"═══════════════════════════════════════",
         f"  审批单号：{sp_no}",
         f"  模板名称：{info.get('sp_name', '未知')}",
-        f"  审批状态：{REVERSE_STATUS_MAP.get(str(info.get('sp_status', '')), '未知')}",
+        f"  审批状态：{display_status}",
         f"  申请人：{info.get('applyer', {}).get('userid', '未知')}"
     ]
+
     apply_time = info.get("apply_time", 0)
     if apply_time > 1e12:
         apply_time //= 1000
@@ -353,6 +383,175 @@ def format_detail(sp_no, detail):
     return "\n".join(lines)
 
 
+def build_json_detail(sp_no, detail):
+    """将 API 返回的审批详情构建为结构化 JSON，方便传给 agent"""
+    info = detail.get("info", {})
+    status_code = info.get("sp_status", 0)
+    apply_time = info.get("apply_time", 0)
+    if apply_time > 1e12:
+        apply_time //= 1000
+
+    # 审批流程
+    flow = []
+    rec_map = {1: "审批中", 2: "已同意", 3: "已驳回", 4: "已转审",
+               11: "已退回", 12: "已加签", 13: "已同意并加签"}
+    for i, rec in enumerate(info.get("sp_record", [])):
+        node = {
+            "step": i + 1,
+            "type": "会签" if rec.get("approverattr") == 2 else "或签",
+            "status": rec_map.get(rec.get("sp_status", 0), "未知"),
+            "details": []
+        }
+        for d in rec.get("details", []):
+            node["details"].append({
+                "approver": d.get("approver", {}).get("userid", "未知"),
+                "action": rec_map.get(d.get("sp_status", 0), "未知"),
+                "comment": d.get("speech", "")
+            })
+        flow.append(node)
+
+    # 表单字段
+    form = []
+    for c in info.get("apply_data", {}).get("contents", []):
+        ctrl = c.get("control", "")
+        title = (c.get("title", [{}])[0].get("text", "") if c.get("title") else "")
+        val = c.get("value", {})
+        if ctrl in ("Text", "Textarea"):
+            value = {"text": val.get("text", "")}
+        elif ctrl == "Number":
+            value = {"number": val.get("new_number", "")}
+        elif ctrl == "Money":
+            value = {"money": val.get("new_money", "")}
+        elif ctrl == "Selector":
+            opts = val.get("selector", {}).get("options", [])
+            selected = []
+            for o in opts:
+                for v in o.get("value", []):
+                    if v.get("text"):
+                        selected.append(v["text"])
+            value = {"selected": selected}
+        elif ctrl == "Date":
+            ts = val.get("date", {}).get("s_timestamp")
+            if ts:
+                if int(ts) > 1e12: ts = int(ts) // 1000
+                value = {"date": datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")}
+            else:
+                value = {"raw": str(val)}
+        elif ctrl == "File":
+            files = val.get("files", [])
+            value = {"file_count": len(files), "files": files}
+        elif ctrl == "Table":
+            children = val.get("children", [])
+            rows = []
+            for child in children:
+                row = {}
+                for cc in child.get("list", []):
+                    ctrl2 = cc.get("control", "")
+                    title2 = (cc.get("title", [{}])[0].get("text", "") if cc.get("title") else "")
+                    val2 = cc.get("value", {})
+                    if ctrl2 in ("Text", "Textarea"):
+                        row[title2] = val2.get("text", "")
+                    elif ctrl2 == "Number":
+                        row[title2] = val2.get("new_number", "")
+                    elif ctrl2 == "Money":
+                        row[title2] = val2.get("new_money", "")
+                    elif ctrl2 == "Selector":
+                        opts2 = val2.get("selector", {}).get("options", [])
+                        sels = [v["text"] for o in opts2 for v in o.get("value", []) if v.get("text")]
+                        row[title2] = sels
+                    elif ctrl2 == "Date":
+                        ts2 = val2.get("date", {}).get("s_timestamp", 0)
+                        if ts2:
+                            if int(ts2) > 1e12: ts2 = int(ts2) // 1000
+                            row[title2] = datetime.fromtimestamp(int(ts2)).strftime("%m-%d %H:%M")
+                        else:
+                            row[title2] = ""
+                    elif ctrl2 == "Money":
+                        row[title2] = val2.get("new_money", "")
+                    else:
+                        row[title2] = str(val2)[:30]
+                if row:
+                    rows.append(row)
+            value = {"table_rows": rows}
+        elif ctrl == "Location":
+            value = {"location": val.get("location", {}).get("title", "")}
+        elif ctrl == "Contact":
+            members = val.get("members", [])
+            value = {"members": [{"userid": m.get("userid", ""), "name": m.get("name", "")} for m in members]}
+        elif ctrl == "DateRange":
+            dr = val.get("date_range", {})
+            begin = dr.get("new_begin", 0)
+            end = dr.get("new_end", 0)
+            if begin > 1e12: begin //= 1000
+            if end > 1e12: end //= 1000
+            value = {
+                "start": datetime.fromtimestamp(begin).strftime("%Y-%m-%d %H:%M") if begin else "",
+                "end": datetime.fromtimestamp(end).strftime("%Y-%m-%d %H:%M") if end else ""
+            }
+        elif ctrl == "Attendance":
+            dr = val.get("attendance", {}).get("date_range", {})
+            begin = dr.get("new_begin", 0)
+            end = dr.get("new_end", 0)
+            if begin > 1e12: begin //= 1000
+            if end > 1e12: end //= 1000
+            value = {
+                "start": datetime.fromtimestamp(begin).strftime("%Y-%m-%d %H:%M") if begin else "",
+                "end": datetime.fromtimestamp(end).strftime("%Y-%m-%d %H:%M") if end else ""
+            }
+        elif ctrl == "Vacation":
+            vac = val.get("vacation", {})
+            sel = vac.get("selector", {}).get("options", [])
+            vac_type = sel[0].get("value", [{}])[0].get("text", "") if sel else ""
+            att = vac.get("attendance", {}).get("date_range", {})
+            begin = att.get("new_begin", 0)
+            end = att.get("new_end", 0)
+            if begin > 1e12: begin //= 1000
+            if end > 1e12: end //= 1000
+            value = {
+                "leave_type": vac_type,
+                "start": datetime.fromtimestamp(begin).strftime("%Y-%m-%d %H:%M") if begin else "",
+                "end": datetime.fromtimestamp(end).strftime("%Y-%m-%d %H:%M") if end else ""
+            }
+        elif ctrl == "RelatedApproval":
+            value = {"related_sp_nos": [r.get("sp_no", "") for r in val.get("related_approval", [])]}
+        else:
+            value = {"raw": str(val)}
+        form.append({
+            "title": title,
+            "control": ctrl,
+            "value": value
+        })
+
+    # 本地审批记录
+    local = get_local_approval_status(sp_no)
+    local_op = None
+    if local:
+        local_op = {
+            "action": local["action"],
+            "operator": local["operator"],
+            "reason": local["reason"],
+            "created_at": local["created_at"]
+        }
+
+    result = {
+        "sp_no": sp_no,
+        "template_name": info.get("sp_name", ""),
+        "status": {
+            "code": status_code,
+            "text": REVERSE_STATUS_MAP.get(str(status_code), "未知")
+        },
+        "applicant": {
+            "userid": info.get("applyer", {}).get("userid", ""),
+            "name": info.get("applyer", {}).get("name", "")
+        },
+        "apply_time": datetime.fromtimestamp(apply_time).strftime("%Y-%m-%dT%H:%M:%S") if apply_time else None,
+        "approval_flow": flow,
+        "form_data": form,
+        "local_operation": local_op
+    }
+    return result
+
+
 # ===================== CLI 命令 =====================
 @click.group()
 def cli():
@@ -400,12 +599,19 @@ def list(start, end, template, status, creator, department, no_status):
                 for i, sp in enumerate(sp_list, 1):
                     try:
                         detail = query_approval(sp)
-                        sp_status = detail.get("info", {}).get("sp_status", "")
-                        status_cn = REVERSE_STATUS_MAP.get(str(sp_status), f"未知({sp_status})")
                         local = get_local_approval_status(sp)
-                        local_tag = ""
+
+                        # 本地记录覆盖列表中的状态
                         if local:
-                            local_tag = f" [本地已{'同意' if local['action'] == 'approve' else '驳回'}]"
+                            if local["action"] == "approve":
+                                status_cn = "已通过（本地）"
+                            else:
+                                status_cn = "已驳回（本地）"
+                            local_tag = ""
+                        else:
+                            sp_status = detail.get("info", {}).get("sp_status", "")
+                            status_cn = REVERSE_STATUS_MAP.get(str(sp_status), f"未知({sp_status})")
+                            local_tag = ""
                     except:
                         status_cn = "获取失败"
                         local_tag = ""
@@ -413,9 +619,9 @@ def list(start, end, template, status, creator, department, no_status):
                     time.sleep(0.1)
 
         click.echo("\n💡 下一步操作：")
-        click.echo("  查看详情：  python ddd.py detail -n <单号>")
-        click.echo("  同意审批：  python ddd.py approve -n <单号>")
-        click.echo("  驳回审批：  python ddd.py reject -n <单号>")
+        click.echo("  查看详情：  python ddd.py detail -n 单号")
+        click.echo("  同意审批：  python ddd.py approve -n 单号")
+        click.echo("  驳回审批：  python ddd.py reject -n 单号")
         click.echo("  待处理：    python ddd.py process")
     except Exception as e:
         click.echo(f"❌ 错误：{e}", err=True)
@@ -426,29 +632,34 @@ def list(start, end, template, status, creator, department, no_status):
 @click.option("--end", "-e", default="", help="结束日期（自动补全）")
 @click.option("--template", "-t", default="", help="模板ID")
 @click.option("--status", "-st", default="", help="状态筛选（汉字或数字）")
-@click.option("--sp-no", "-n", default="", help="指定单号")
-def detail(start, end, template, status, sp_no):
+@click.option("--sp-no", "-n", default="", help="审批单号，直接输入数字，无需引号或尖括号")
+@click.option("--json", "output_json", is_flag=True, help="以 JSON 格式输出审批详情")
+def detail(start, end, template, status, sp_no, output_json):
     """查看审批详情"""
     try:
         if sp_no:
-            click.echo(f"🔍 查询单号：{sp_no}")
             data = query_approval(sp_no)
-            click.echo(format_detail(sp_no, data))
-            
-            local = get_local_approval_status(sp_no)
-            if local:
-                action_cn = "同意" if local["action"] == "approve" else "驳回"
-                click.echo(f"\n📋 本地审批记录：已{action_cn} | 操作人：{local['operator']} | 时间：{local['created_at']}")
-                if local["reason"]:
-                    click.echo(f"   原因：{local['reason']}")
-            
-            info = data.get("info", {})
-            if info.get("sp_status") == 1:
-                click.echo("\n💡 该单据审批中，可在CLI中操作：")
-                click.echo("  同意：python ddd.py approve -n <单号>")
-                click.echo("  驳回：python ddd.py reject -n <单号> -r \"原因\"")
+            if output_json:
+                result = build_json_detail(sp_no, data)
+                click.echo(json.dumps(result, ensure_ascii=False, indent=2))
             else:
-                click.echo("\n💡 该单据已处理，无需操作。")
+                click.echo(f"🔍 查询单号：{sp_no}")
+                click.echo(format_detail(sp_no, data))
+                
+                local = get_local_approval_status(sp_no)
+                if local:
+                    action_cn = "同意" if local["action"] == "approve" else "驳回"
+                    click.echo(f"\n📋 本地审批记录：已{action_cn} | 操作人：{local['operator']} | 时间：{local['created_at']}")
+                    if local["reason"]:
+                        click.echo(f"   原因：{local['reason']}")
+                
+                info = data.get("info", {})
+                if info.get("sp_status") == 1:
+                    click.echo("\n💡 该单据审批中，可在CLI中操作：")
+                    click.echo("  同意：python ddd.py approve -n 单号")
+                    click.echo("  驳回：python ddd.py reject -n 单号 -r \"原因\"")
+                else:
+                    click.echo("\n💡 该单据已处理，无需操作。")
         else:
             if not start or not end:
                 click.echo("❌ 需要 --start 和 --end", err=True)
@@ -473,8 +684,8 @@ def detail(start, end, template, status, sp_no):
                     click.echo(format_detail(sp, query_approval(sp)))
                     time.sleep(0.1)
                 click.echo("\n💡 下一步操作：")
-                click.echo("  同意：python ddd.py approve -n <单号>")
-                click.echo("  驳回：python ddd.py reject -n <单号> -r \"原因\"")
+                click.echo("  同意：python ddd.py approve -n 单号")
+                click.echo("  驳回：python ddd.py reject -n 单号 -r \"原因\"")
     except Exception as e:
         click.echo(f"❌ 错误：{e}", err=True)
 
@@ -514,8 +725,8 @@ def process(start, end, days, sp_no):
             info = data.get("info", {})
             if info.get("sp_status") == 1:
                 click.echo("\n💡 该单据审批中，可在CLI中操作：")
-                click.echo("  同意：python ddd.py approve -n <单号>")
-                click.echo("  驳回：python ddd.py reject -n <单号> -r \"原因\"")
+                click.echo("  同意：python ddd.py approve -n 单号")
+                click.echo("  驳回：python ddd.py reject -n 单号 -r \"原因\"")
             else:
                 click.echo("\n💡 该单据已处理，无需操作。")
         else:
@@ -549,9 +760,9 @@ def process(start, end, days, sp_no):
                 t = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else ""
                 click.echo(f"  [{i}] {sp} | {name} | {applyer} | {t}{tag}")
             click.echo("\n💡 快捷操作：")
-            click.echo("  同意：python ddd.py approve -n <单号>")
-            click.echo("  驳回：python ddd.py reject -n <单号> -r \"原因\"")
-            click.echo("  详情：python ddd.py detail -n <单号>")
+            click.echo("  同意：python ddd.py approve -n 单号")
+            click.echo("  驳回：python ddd.py reject -n 单号 -r \"原因\"")
+            click.echo("  详情：python ddd.py detail -n 单号")
     except Exception as e:
         click.echo(f"❌ 错误：{e}", err=True)
 

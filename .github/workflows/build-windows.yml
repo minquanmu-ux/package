@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:          # 支持手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: 安装依赖
+      run: |
+        pip install --upgrade pip
+        pip install requests click
+        pip install pyinstaller
+
+    - name: 使用 PyInstaller 打包
+      run: |
+        pyinstaller --onefile --name ddd ddd.py
+
+    - name: 上传构建结果
+      uses: actions/upload-artifact@v4
+      with:
+        name: ddd-Windows
+        path: dist/ddd.exe
